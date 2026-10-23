@@ -1,0 +1,8 @@
+env              = "dev"
+cpu              = 256
+memory           = 512
+desired_count    = 1
+container_port   = 8080
+aws_region       = "eu-central-1"
+image_tag        = "latest"
+cpu_architecture = "ARM64"

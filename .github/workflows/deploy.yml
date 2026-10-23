@@ -1,0 +1,151 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy to
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: 1.17.0
+  TF_DIR: terraform
+
+jobs:
+  build:
+    name: Build and check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet, build and test
+        run: |
+          go vet ./...
+          go build ./...
+          go test ./...
+
+      - name: Build container image
+        run: docker build -t event-service:ci .
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt and validate
+        run: |
+          terraform fmt -check -recursive
+          for dir in . bootstrap; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+        working-directory: ${{ env.TF_DIR }}
+
+  deploy:
+    name: Deploy (${{ inputs.environment || 'dev' }})
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+      url: ${{ steps.smoke.outputs.service_url }}
+    # Never run two deploys to the same environment at once.
+    concurrency:
+      group: deploy-${{ inputs.environment || 'dev' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS
+    env:
+      DEPLOY_ENV: ${{ inputs.environment || 'dev' }}
+      IMAGE_TAG: ${{ github.sha }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_env: ${{ inputs.environment || 'dev' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_image_tag: ${{ github.sha }}
+      # GitHub-hosted ubuntu-latest runners build amd64 images.
+      TF_VAR_cpu_architecture: X86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false # keep `terraform output -raw` clean
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=event-service/${DEPLOY_ENV}.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      # The ECS service needs the image to exist, so create the registry first.
+      - name: Ensure ECR repository exists
+        id: ecr
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve -target=aws_ecr_repository.this
+          echo "repository=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.repository }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve
+
+      - name: Wait for service to become stable
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$(terraform output -raw ecs_cluster_name)" \
+            --services "$(terraform output -raw ecs_service_name)"
+
+      - name: Smoke test
+        id: smoke
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          url="$(terraform output -raw service_url)"
+          echo "service_url=$url" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 20); do
+            if curl -fsS "$url/health" && curl -fsS "$url/ready"; then
+              echo
+              echo "Deployed: $url"
+              exit 0
+            fi
+            echo "Not ready yet (attempt $i), retrying in 10s..."
+            sleep 10
+          done
+          echo "Service did not become healthy at $url" >&2
+          exit 1
