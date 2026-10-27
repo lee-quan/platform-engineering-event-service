@@ -67,7 +67,6 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      id-token: write # OIDC token for AWS
     env:
       DEPLOY_ENV: ${{ inputs.environment || 'dev' }}
       IMAGE_TAG: ${{ github.sha }}
@@ -81,9 +80,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Access key for the bootstrap deploy user (GitHub OIDC is blocked by
+      # the AWS organization's SCPs in this account).
       - uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v4

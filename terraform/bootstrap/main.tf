@@ -1,7 +1,10 @@
 # One-time setup, applied locally with admin credentials:
 #   - S3 bucket for the main configuration's Terraform state
-#   - GitHub OIDC identity provider
-#   - IAM role that GitHub Actions assumes to deploy
+#   - IAM user that GitHub Actions uses to deploy
+#
+# The organization's SCPs block GitHub OIDC providers in this account, so the
+# workflow authenticates with an access key for this user. The key is created
+# outside Terraform (console or CLI) so the secret never lands in state.
 #
 # This configuration keeps its own (small) state locally.
 
@@ -31,7 +34,6 @@ data "aws_caller_identity" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
-  oidc_url   = "https://token.actions.githubusercontent.com"
 }
 
 # --- Terraform state bucket ---------------------------------------------------
@@ -64,66 +66,21 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
   restrict_public_buckets = true
 }
 
-# --- GitHub OIDC provider -----------------------------------------------------
+# --- Deploy user used by GitHub Actions ---------------------------------------
 
-# Only one provider per URL can exist in an account. Set
-# create_oidc_provider = false if another project already created it.
-resource "aws_iam_openid_connect_provider" "github" {
-  count          = var.create_oidc_provider ? 1 : 0
-  url            = local.oidc_url
-  client_id_list = ["sts.amazonaws.com"]
-}
-
-data "aws_iam_openid_connect_provider" "github" {
-  count = var.create_oidc_provider ? 0 : 1
-  url   = local.oidc_url
-}
-
-locals {
-  oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
-}
-
-# --- Deploy role assumed by GitHub Actions ------------------------------------
-
-data "aws_iam_policy_document" "github_assume" {
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [local.oidc_provider_arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    # Only workflow jobs running in one of these GitHub environments of this
-    # repository can assume the role.
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = [for e in var.github_environments : "repo:${var.github_repo}:environment:${e}"]
-    }
-  }
-}
-
-resource "aws_iam_role" "github_deploy" {
-  name               = "${var.app_name}-github-deploy"
-  assume_role_policy = data.aws_iam_policy_document.github_assume.json
+resource "aws_iam_user" "github_deploy" {
+  name = "${var.app_name}-github-deploy"
 }
 
 # Broad service access (ECR, ECS, ELB, EC2 security groups, CloudWatch, S3).
 # Simplified for a skeleton: replace with a least-privilege policy for production.
-resource "aws_iam_role_policy_attachment" "power_user" {
-  role       = aws_iam_role.github_deploy.name
+resource "aws_iam_user_policy_attachment" "power_user" {
+  user       = aws_iam_user.github_deploy.name
   policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
 }
 
-# PowerUserAccess excludes IAM, so allow managing only this app's roles.
-data "aws_iam_policy_document" "iam_scoped" {
+data "aws_iam_policy_document" "deploy_extra" {
+  # PowerUserAccess excludes IAM, so allow managing only this app's roles.
   statement {
     sid = "ManageAppRoles"
     actions = [
@@ -157,10 +114,23 @@ data "aws_iam_policy_document" "iam_scoped" {
       ]
     }
   }
+
+  # Long-lived keys: limit the blast radius to the deploy region.
+  statement {
+    sid         = "DenyOtherRegions"
+    effect      = "Deny"
+    not_actions = ["iam:*", "sts:*"]
+    resources   = ["*"]
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.aws_region]
+    }
+  }
 }
 
-resource "aws_iam_role_policy" "iam_scoped" {
-  name   = "manage-app-roles"
-  role   = aws_iam_role.github_deploy.id
-  policy = data.aws_iam_policy_document.iam_scoped.json
+resource "aws_iam_user_policy" "deploy_extra" {
+  name   = "deploy-extra"
+  user   = aws_iam_user.github_deploy.name
+  policy = data.aws_iam_policy_document.deploy_extra.json
 }

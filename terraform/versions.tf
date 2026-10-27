@@ -12,7 +12,7 @@ terraform {
   #   terraform init \
   #     -backend-config="bucket=<tf_state_bucket from bootstrap>" \
   #     -backend-config="key=event-service/dev.tfstate" \
-  #     -backend-config="region=eu-central-1"
+  #     -backend-config="region=ap-southeast-2"
   backend "s3" {
     use_lockfile = true
     encrypt      = true
